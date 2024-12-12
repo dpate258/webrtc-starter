@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Signaling Demo</title>
+    <style>
+        .video-container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+        }
+        .video-wrapper {
+            width: 400px;
+            height: 300px;
+            border: 2px solid black;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+    </style>
+</head>
+<body>
+    <h1 style="text-align: center;">WebRTC Signaling Demo</h1>
+    
+    <div class="video-container">
+        <div>
+            <div class="video-wrapper">
+                <video id="local-video" autoplay playsinline muted></video>
+            </div>
+            <p style="text-align: center;">Local Video</p>
+        </div>
+        <div>
+            <div class="video-wrapper">
+                <video id="remote-video" autoplay playsinline></video>
+            </div>
+            <p style="text-align: center;">Remote Video</p>
+        </div>
+    </div>
+
+    <div style="text-align: center; margin-top: 20px;">
+        <button id="start-connection" onclick="startConnection()">Start Connection</button>
+        <button id="create-offer" onclick="createOffer()">Call</button>
+    </div>
+
+    <div id="status-log"></div>
+
+    <script>
+        
+    // Init the socket url stun server
+    const SOCKET_URL = 'ws://localhost:3001';
+    const servers = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+        ]
+    };
+
+
+    const localVideo = document.getElementById('local-video');
+    const remoteVideo = document.getElementById('remote-video');
+
+    let signalingSocket = null;
+    let peerConnection = null;
+    let localStream = null;
+
+    // Initializes the WebSocket connection for signaling
+    // Sets up event handlers for connection, messages, and closure
+    function initWebSocket() {
+        signalingSocket = new WebSocket(SOCKET_URL);
+        const pendingCandidates = [];
+
+        signalingSocket.onopen = () => {
+            console.log('WebSocket connected');
+        };
+
+        signalingSocket.onmessage = async (event) => {
+            try {
+                const data = typeof event.data === 'string' 
+                    ? JSON.parse(event.data) 
+                    : await event.data.text().then(JSON.parse);
+
+                console.log('Received:', data);
+
+                if (data.type === 'offer') {
+                    await handleRemoteOffer(data);
+                } else if (data.type === 'answer') {
+                    await handleRemoteAnswer(data);
+                } else if (data.type === 'candidate') {
+                    await handleRemoteCandidate(data.candidate);
+                }
+            } catch (error) {
+                console.error('Error processing message:', error);
+            }
+        };
+
+        signalingSocket.onclose = () => {
+            console.log('WebSocket disconnected');
+        };
+    }
+
+    // Initiates the local media stream by accessing user's camera and microphone
+    // Connects to the WebSocket if not already connected
+    async function startConnection() {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true
+            });
+            
+            localVideo.srcObject = localStream;
+            console.log('Local stream started');
+
+            if (!signalingSocket || signalingSocket.readyState !== WebSocket.OPEN) {
+                initWebSocket();
+            }
+        } catch (error) {
+            console.error('Error starting connection:', error);
+        }
+    }
+
+    // Creates a WebRTC offer to initiate a peer connection
+    // Sets up local media tracks and ICE candidate handling
+    async function createOffer() {
+        if (!localStream) {
+            alert('Please start connection first');
+            return;
+        }
+
+        try {
+
+            peerConnection = new RTCPeerConnection(servers);
+
+            peerConnection.ontrack = (event) => {
+                const remoteStream = new MediaStream();
+                event.streams[0].getTracks().forEach(track => {
+                    remoteStream.addTrack(track);
+                });
+                remoteVideo.srcObject = remoteStream;
+                console.log('Remote stream received');
+            };
+
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    signalingSocket.send(JSON.stringify({
+                        type: 'candidate',
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            signalingSocket.send(JSON.stringify({
+                type: 'offer',
+                ...peerConnection.localDescription.toJSON()
+            }));
+            
+            console.log('Offer created and sent');
+        } catch (error) {
+            console.error('Error creating offer:', error);
+        }
+    }
+
+    // Handles an incoming WebRTC offer from a remote peer
+    // Creates a peer connection, sets remote description, and sends an answer
+    async function handleRemoteOffer(offer) {
+        try {
+            peerConnection = new RTCPeerConnection(servers);
+
+            peerConnection.ontrack = (event) => {
+                const remoteStream = new MediaStream();
+                event.streams[0].getTracks().forEach(track => {
+                    remoteStream.addTrack(track);
+                });
+                remoteVideo.srcObject = remoteStream;
+                console.log('Remote stream received');
+            };
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+            }
+
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    signalingSocket.send(JSON.stringify({
+                        type: 'candidate',
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+
+            signalingSocket.send(JSON.stringify({
+                type: 'answer',
+                ...peerConnection.localDescription.toJSON()
+            }));
+            
+            console.log('Received offer, sent answer');
+        } catch (error) {
+            console.error('Error handling remote offer:', error);
+        }
+    }
+    
+    // Handles an incoming WebRTC "answer" from the remote peer
+    // Sets the remote description to complete the peer connection setup
+    async function handleRemoteAnswer(answer) {
+        if (!peerConnection) {
+            console.error('No peer connection');
+            return;
+        }
+
+        try {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+            console.log('Remote answer received');
+        } catch (error) {
+            console.error('Error setting remote description:', error);
+        }
+    }
+
+    // Handles incoming "ICE candidates" from the remote peer
+    // Adds candidates to the peer connection to establish the most efficient connection path
+    async function handleRemoteCandidate(candidate) {
+        if (!peerConnection) {
+            console.error('No peer connection');
+            return;
+        }
+
+        try {
+            if (peerConnection.remoteDescription) {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                console.log('ICE candidate added');
+            } else {
+                console.warn('Remote description not set, candidate queued');
+            }
+        } catch (error) {
+            console.error('Error adding ICE candidate:', error);
+        }
+    }
+
+    </script>
+</body>
+</html>
